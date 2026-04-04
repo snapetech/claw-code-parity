@@ -11,6 +11,7 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    Ollama(OpenAiCompatClient),
 }
 
 impl ProviderClient {
@@ -25,15 +26,21 @@ impl ProviderClient {
         let resolved_model = providers::resolve_model_alias(model);
         match providers::detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
-                Some(auth) => AnthropicClient::from_auth(auth),
-                None => AnthropicClient::from_env()?,
+                Some(auth) => apply_retry_policy_anthropic(AnthropicClient::from_auth(auth)),
+                None => apply_retry_policy_anthropic(AnthropicClient::from_env()?),
             })),
             ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::xai(),
-            )?)),
+            )
+            .map(|client| apply_retry_policy_openai_compat(client, ProviderKind::Xai))?)),
             ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::openai(),
-            )?)),
+            )
+            .map(|client| apply_retry_policy_openai_compat(client, ProviderKind::OpenAi))?)),
+            ProviderKind::Ollama => Ok(Self::Ollama(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::ollama(),
+            )
+            .map(|client| apply_retry_policy_openai_compat(client, ProviderKind::Ollama))?)),
         }
     }
 
@@ -43,6 +50,7 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::Ollama(_) => ProviderKind::Ollama,
         }
     }
 
@@ -58,7 +66,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Ollama(_) => None,
         }
     }
 
@@ -66,7 +74,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Ollama(_) => None,
         }
     }
 
@@ -76,7 +84,9 @@ impl ProviderClient {
     ) -> Result<MessageResponse, ApiError> {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
-            Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::Xai(client) | Self::OpenAi(client) | Self::Ollama(client) => {
+                client.send_message(request).await
+            }
         }
     }
 
@@ -89,7 +99,7 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::Anthropic),
-            Self::Xai(client) | Self::OpenAi(client) => client
+            Self::Xai(client) | Self::OpenAi(client) | Self::Ollama(client) => client
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
@@ -131,6 +141,36 @@ pub fn read_base_url() -> String {
 #[must_use]
 pub fn read_xai_base_url() -> String {
     openai_compat::read_base_url(OpenAiCompatConfig::xai())
+}
+
+#[must_use]
+pub fn read_ollama_base_url() -> String {
+    openai_compat::read_base_url(OpenAiCompatConfig::ollama())
+}
+
+fn apply_retry_policy_openai_compat(
+    client: OpenAiCompatClient,
+    provider: ProviderKind,
+) -> OpenAiCompatClient {
+    match providers::load_retry_policy(provider) {
+        Some(policy) => client.with_retry_policy(
+            policy.max_retries,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(2),
+        ),
+        None => client,
+    }
+}
+
+fn apply_retry_policy_anthropic(client: AnthropicClient) -> AnthropicClient {
+    match providers::load_retry_policy(ProviderKind::Anthropic) {
+        Some(policy) => client.with_retry_policy(
+            policy.max_retries,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(2),
+        ),
+        None => client,
+    }
 }
 
 #[cfg(test)]

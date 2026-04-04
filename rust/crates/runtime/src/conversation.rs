@@ -323,6 +323,14 @@ where
             let (assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains("assistant stream produced no content")
+                            && !tool_results.is_empty() =>
+                    {
+                        break;
+                    }
                     Err(error) => {
                         self.record_turn_failed(iterations, &error);
                         return Err(error);
@@ -356,6 +364,10 @@ where
             if pending_tool_uses.is_empty() {
                 break;
             }
+
+            let all_terminal_user_message_tools = pending_tool_uses
+                .iter()
+                .all(|(_, tool_name, _)| is_terminal_user_message_tool(tool_name));
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
@@ -456,6 +468,10 @@ where
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
+            }
+
+            if all_terminal_user_message_tools {
+                break;
             }
         }
 
@@ -709,6 +725,10 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
             text: std::mem::take(text),
         });
     }
+}
+
+fn is_terminal_user_message_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "SendUserMessage" | "Brief")
 }
 
 fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
@@ -1588,6 +1608,48 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream produced no content"));
+    }
+
+    #[test]
+    fn run_turn_allows_empty_followup_after_tool_result() {
+        struct EmptyAfterToolApi {
+            calls: usize,
+        }
+
+        impl ApiClient for EmptyAfterToolApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "payload".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![AssistantEvent::MessageStop])
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EmptyAfterToolApi { calls: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("say hi", None)
+            .expect("empty followup after tool should not fail");
+
+        assert_eq!(summary.tool_results.len(), 1);
     }
 
     #[test]

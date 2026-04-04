@@ -1,8 +1,13 @@
+use std::env;
+use std::fs;
 use std::future::Future;
 use std::pin::Pin;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
+use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
 pub mod openai_compat;
@@ -23,11 +28,27 @@ pub trait Provider {
     ) -> ProviderFuture<'a, Self::Stream>;
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LearnedRetryPolicy {
+    pub provider: String,
+    pub max_retries: u32,
+    pub holdout_success_rate: f64,
+    pub holdout_avg_attempts: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LearnedRetryPolicySet {
+    version: u32,
+    generated_at_ms: u64,
+    policies: Vec<LearnedRetryPolicy>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    Ollama,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +154,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi | ProviderKind::Ollama => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -158,6 +179,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    if canonical.contains(':') {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Ollama,
+            auth_env: "OLLAMA_API_KEY",
+            base_url_env: "OLLAMA_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OLLAMA_BASE_URL,
+        });
+    }
     None
 }
 
@@ -165,6 +194,15 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
+    }
+    if std::env::var("OLLAMA_BASE_URL")
+        .ok()
+        .is_some_and(|value| !value.is_empty())
+        || std::env::var("OLLAMA_HOST")
+            .ok()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return ProviderKind::Ollama;
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
@@ -183,9 +221,75 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
     if canonical.contains("opus") {
         32_000
+    } else if canonical.contains(':') {
+        2_048
     } else {
         64_000
     }
+}
+
+#[must_use]
+pub fn load_retry_policy(provider: ProviderKind) -> Option<LearnedRetryPolicy> {
+    let cwd = env::current_dir().ok()?;
+    let path = self_improvement_dir(&cwd).join("retry-policy.json");
+    let contents = fs::read_to_string(path).ok()?;
+    let policies = serde_json::from_str::<LearnedRetryPolicySet>(&contents).ok()?;
+    let provider_name = match provider {
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Xai => "xai",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Ollama => "ollama",
+    };
+    policies
+        .policies
+        .into_iter()
+        .find(|policy| policy.provider == provider_name)
+}
+
+pub fn record_retry_trace(
+    provider: ProviderKind,
+    attempts: u32,
+    success: bool,
+    duration_ms: u128,
+) {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let trace_dir = self_improvement_dir(&cwd);
+    if fs::create_dir_all(&trace_dir).is_err() {
+        return;
+    }
+    let trace_path = trace_dir.join("retry-traces.jsonl");
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace_path)
+    else {
+        return;
+    };
+
+    let provider_name = match provider {
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Xai => "xai",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Ollama => "ollama",
+    };
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_millis());
+    let record = serde_json::json!({
+        "created_at_ms": created_at_ms,
+        "provider": provider_name,
+        "attempts": attempts,
+        "success": success,
+        "duration_ms": duration_ms,
+    });
+    let _ = std::io::Write::write_all(&mut file, format!("{record}\n").as_bytes());
+}
+
+fn self_improvement_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".claw").join("self-improvement")
 }
 
 #[cfg(test)]

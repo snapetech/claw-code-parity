@@ -10,7 +10,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, BTreeSet as OrderedSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -24,8 +24,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient,
+    OpenAiCompatConfig, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -48,14 +49,16 @@ use runtime::{
     ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
     UsageTracker,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{execute_tool, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
+    } else if model.contains(':') {
+        512
     } else {
         64_000
     }
@@ -112,6 +115,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Agents { args } => LiveCli::print_agents(args.as_deref())?,
         CliAction::Mcp { args } => LiveCli::print_mcp(args.as_deref())?,
         CliAction::Skills { args } => LiveCli::print_skills(args.as_deref())?,
+        CliAction::SelfImproveRouter => run_self_improve_router()?,
+        CliAction::SelfImproveTools => run_self_improve_tools()?,
+        CliAction::SelfImproveRetries => run_self_improve_retries()?,
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
         CliAction::ResumeSession {
@@ -157,6 +163,9 @@ enum CliAction {
     Skills {
         args: Option<String>,
     },
+    SelfImproveRouter,
+    SelfImproveTools,
+    SelfImproveRetries,
     PrintSystemPrompt {
         cwd: PathBuf,
         date: String,
@@ -355,6 +364,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "skills" => Ok(CliAction::Skills {
             args: join_optional_args(&rest[1..]),
         }),
+        "self-improve" => match rest.get(1).map(String::as_str) {
+            Some("router") if rest.len() == 2 => Ok(CliAction::SelfImproveRouter),
+            Some("tools") if rest.len() == 2 => Ok(CliAction::SelfImproveTools),
+            Some("retries") if rest.len() == 2 => Ok(CliAction::SelfImproveRetries),
+            Some(other) => Err(format!(
+                "unknown self-improve target: {other} (expected: router, tools, retries)"
+            )),
+            None => Err(
+                "self-improve requires a target (expected: router, tools, retries)".to_string(),
+            ),
+        },
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
@@ -412,6 +432,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "agents"
             | "mcp"
             | "skills"
+            | "self-improve"
             | "system-prompt"
             | "login"
             | "logout"
@@ -2017,7 +2038,7 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt_for_model(&model)?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -2136,10 +2157,12 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let started = Instant::now();
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                record_tool_trace(&self.model, input, &summary, started.elapsed().as_millis(), None);
                 self.replace_runtime(runtime)?;
                 spinner.finish(
                     "✨ Done",
@@ -2154,6 +2177,7 @@ impl LiveCli {
                     );
                 }
                 self.persist_session()?;
+                maybe_auto_self_improve(&self.model);
                 Ok(())
             }
             Err(error) => {
@@ -2173,20 +2197,115 @@ impl LiveCli {
         input: &str,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(command) = fast_ollama_bash_command(&self.model, input) {
+            return self.run_fast_ollama_bash_prompt(input, &command, output_format);
+        }
         match output_format {
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
     }
 
+    fn run_fast_ollama_bash_prompt(
+        &mut self,
+        input: &str,
+        command: &str,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let started = Instant::now();
+        let result = execute_tool("bash", &json!({ "command": command }))
+            .map_err(std::io::Error::other)?;
+        let duration_ms = started.elapsed().as_millis();
+        let parsed = serde_json::from_str::<serde_json::Value>(&result)?;
+        let stdout = parsed
+            .get("stdout")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let stderr = parsed
+            .get("stderr")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let message = if stdout.is_empty() {
+            stderr.clone()
+        } else {
+            stdout.clone()
+        };
+
+        record_router_trace(
+            &self.model,
+            input,
+            "ollama_bash",
+            command,
+            duration_ms,
+            stderr.is_empty(),
+            &message,
+        );
+        record_fast_tool_trace(&self.model, input, "bash", duration_ms, stderr.is_empty(), "ollama_bash");
+
+        self.persist_session()?;
+        maybe_auto_self_improve(&self.model);
+
+        match output_format {
+            CliOutputFormat::Text => {
+                if !stdout.is_empty() {
+                    println!("{stdout}");
+                }
+                if !stderr.is_empty() {
+                    eprintln!("{stderr}");
+                }
+            }
+            CliOutputFormat::Json => {
+                println!(
+                    "{}",
+                    json!({
+                        "message": message,
+                        "model": self.model,
+                        "iterations": 1,
+                        "auto_compaction": null,
+                        "tool_uses": [{
+                            "id": "fast-ollama-bash",
+                            "name": "bash",
+                            "input": json!({ "command": command }).to_string(),
+                        }],
+                        "tool_results": [{
+                            "tool_use_id": "fast-ollama-bash",
+                            "tool_name": "bash",
+                            "output": result,
+                            "is_error": false,
+                        }],
+                        "prompt_cache_events": [],
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                        "estimated_cost": "$0.0000",
+                        "fast_path": "ollama_bash",
+                        "prompt": input,
+                    })
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let started = Instant::now();
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        record_tool_trace(&self.model, input, &summary, started.elapsed().as_millis(), None);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
+        maybe_auto_self_improve(&self.model);
         println!(
             "{}",
             json!({
@@ -2440,11 +2559,12 @@ impl LiveCli {
         let previous = self.model.clone();
         let session = self.runtime.session().clone();
         let message_count = session.messages.len();
+        let system_prompt = build_system_prompt_for_model(&model)?;
         let runtime = build_runtime(
             session,
             &self.session.id,
             model.clone(),
-            self.system_prompt.clone(),
+            system_prompt.clone(),
             true,
             true,
             self.allowed_tools.clone(),
@@ -2453,6 +2573,7 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
+        self.system_prompt = system_prompt;
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
@@ -3847,6 +3968,1102 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     )?)
 }
 
+fn build_system_prompt_for_model(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let resolved_model = api::resolve_model_alias(model);
+    if preferred_provider_kind(&resolved_model) != ProviderKind::Ollama {
+        return build_system_prompt();
+    }
+
+    let fast_mode = std::env::var("CLAW_OLLAMA_FAST")
+        .ok()
+        .map(|value| value != "0")
+        .unwrap_or(true);
+
+    let mut lines = vec![
+        "You are an interactive software engineering agent running against a local Ollama model.".to_string(),
+        "Be concise and literal.".to_string(),
+        "For normal one-shot prompts, prefer a single direct text answer.".to_string(),
+        "Only call tools when the user requests an action or when external state must be read or changed to answer correctly.".to_string(),
+        "If the user explicitly asks to run a shell command or names bash, ssh, git, curl, ls, cat, rg, grep, find, or uptime, call the bash tool immediately instead of talking about it first.".to_string(),
+        "After a tool result, answer directly from the tool output without extra analysis.".to_string(),
+        "If you choose a user-facing tool, use a single user-facing tool call when the user explicitly asks for that.".to_string(),
+        "Do not call StructuredOutput unless the user explicitly requests structured JSON output.".to_string(),
+        "Do not call SendUserMessage more than once for the same request unless the user asks for a follow-up.".to_string(),
+        "Do not ask clarifying questions when the user instruction is already specific and answerable.".to_string(),
+    ];
+
+    if fast_mode {
+        lines.push("Fast local mode is enabled: minimize deliberation, minimize tool count, and prefer the shortest correct action path.".to_string());
+    }
+
+    let cwd = env::current_dir()?;
+    let learned_tool_hints = load_learned_tool_hints(&cwd);
+    for hint in learned_tool_hints.into_iter().take(12) {
+        lines.push(format!(
+            "Learned tool hint: when the prompt mentions \"{}\", prefer the {} tool.",
+            hint.phrase, hint.tool_name
+        ));
+    }
+
+    Ok(vec![lines.join(" ")])
+}
+
+fn fast_ollama_bash_command(model: &str, input: &str) -> Option<String> {
+    if preferred_provider_kind(&api::resolve_model_alias(model)) != ProviderKind::Ollama {
+        return None;
+    }
+    if std::env::var("CLAW_OLLAMA_FAST")
+        .ok()
+        .is_some_and(|value| value == "0")
+    {
+        return None;
+    }
+
+    explicit_bash_command(input).or_else(|| inferred_ollama_bash_command(input))
+}
+
+fn explicit_bash_command(input: &str) -> Option<String> {
+    let marker = "use bash to run:";
+    let lower = input.to_ascii_lowercase();
+    let start = lower.find(marker)?;
+    let raw = input.get(start + marker.len()..)?.trim();
+
+    let end_markers = [
+        ". return",
+        "\nreturn",
+        ". give",
+        "\ngive",
+        ". summarize",
+        "\nsummarize",
+    ];
+    let lower_raw = raw.to_ascii_lowercase();
+    let end = end_markers
+        .iter()
+        .filter_map(|marker| lower_raw.find(marker))
+        .min()
+        .unwrap_or(raw.len());
+    let command = raw[..end].trim().trim_end_matches('.').trim();
+
+    (!command.is_empty()).then(|| command.to_string())
+}
+
+fn inferred_ollama_bash_command(input: &str) -> Option<String> {
+    let normalized = input.to_ascii_lowercase();
+
+    if let Some(command) = learned_router_command(input, &normalized) {
+        return Some(command);
+    }
+
+    if normalized.contains("ssh to") && normalized.contains("uptime") {
+        return synthesize_router_command("ssh_uptime", input, &normalized);
+    }
+
+    if normalized.contains("git status") || normalized.contains("show status") {
+        return synthesize_router_command("git_status", input, &normalized);
+    }
+    if normalized.contains("git diff")
+        || normalized.contains("show diff")
+        || normalized.contains("current diff")
+    {
+        return synthesize_router_command("git_diff", input, &normalized);
+    }
+    if normalized.contains("list files") || normalized.contains("show files") {
+        return synthesize_router_command("list_files", input, &normalized);
+    }
+    if normalized.starts_with("pwd") || normalized.contains("current directory") {
+        return synthesize_router_command("pwd", input, &normalized);
+    }
+
+    None
+}
+
+fn learned_router_command(input: &str, normalized: &str) -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    let rules = load_learned_router_rules(&cwd);
+    for rule in rules {
+        if normalized.contains(&rule.phrase) {
+            if let Some(command) = synthesize_router_command(&rule.family, input, normalized) {
+                return Some(command);
+            }
+        }
+    }
+    None
+}
+
+fn synthesize_router_command(family: &str, input: &str, _normalized: &str) -> Option<String> {
+    match family {
+        "ssh_uptime" => {
+            let hosts = extract_host_candidates(input);
+            if hosts.is_empty() {
+                return None;
+            }
+            Some(
+                hosts
+                    .into_iter()
+                    .map(|host| format!("ssh {host} uptime"))
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            )
+        }
+        "git_status" => Some("git status --short --branch".to_string()),
+        "git_diff" => Some("git diff".to_string()),
+        "list_files" => Some("rg --files".to_string()),
+        "pwd" => Some("pwd".to_string()),
+        _ => None,
+    }
+}
+
+fn extract_host_candidates(input: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for token in input.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '-' && ch != '_')
+            .to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let lower = cleaned.to_ascii_lowercase();
+        let looks_like_host = cleaned.chars().any(|ch| ch.is_ascii_digit())
+            || cleaned.contains('.')
+            || cleaned.contains('-')
+            || lower.starts_with("ksp");
+        if looks_like_host && !hosts.iter().any(|existing| existing == &cleaned) {
+            hosts.push(cleaned);
+        }
+    }
+    hosts
+}
+
+fn record_router_trace(
+    model: &str,
+    prompt: &str,
+    route: &str,
+    command: &str,
+    duration_ms: u128,
+    success: bool,
+    output_preview: &str,
+) {
+    if std::env::var("CLAW_SELF_IMPROVE_LOG")
+        .ok()
+        .is_some_and(|value| value == "0")
+    {
+        return;
+    }
+
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let trace_dir = cwd.join(".claw").join("self-improvement");
+    if fs::create_dir_all(&trace_dir).is_err() {
+        return;
+    }
+    let trace_path = trace_dir.join("router-traces.jsonl");
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace_path)
+    else {
+        return;
+    };
+
+    let created_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_millis());
+    let preview = truncate_for_summary(output_preview.trim(), 240);
+    let record = json!({
+        "created_at_ms": created_at_ms,
+        "model": model,
+        "route": route,
+        "prompt": prompt,
+        "command": command,
+        "duration_ms": duration_ms,
+        "success": success,
+        "output_preview": preview,
+    });
+
+    let _ = writeln!(file, "{record}");
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RouterTraceRecord {
+    #[serde(default)]
+    created_at_ms: u64,
+    model: String,
+    route: String,
+    prompt: String,
+    command: String,
+    duration_ms: u64,
+    success: bool,
+    #[serde(default)]
+    output_preview: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LearnedRouterRule {
+    family: String,
+    phrase: String,
+    train_support: usize,
+    holdout_matches: usize,
+    holdout_correct: usize,
+    precision: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LearnedRouterRuleSet {
+    version: u32,
+    generated_at_ms: u64,
+    rules: Vec<LearnedRouterRule>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RouterTrainingReport {
+    trace_count: usize,
+    usable_trace_count: usize,
+    training_count: usize,
+    holdout_count: usize,
+    candidate_count: usize,
+    promoted_rules: Vec<LearnedRouterRule>,
+}
+
+#[derive(Debug, Clone)]
+struct RouterCandidateRule {
+    family: String,
+    phrase: String,
+    train_support: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ToolTraceRecord {
+    created_at_ms: u64,
+    model: String,
+    prompt: String,
+    tool_names: Vec<String>,
+    duration_ms: u64,
+    success: bool,
+    iterations: usize,
+    #[serde(default)]
+    fast_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LearnedToolHint {
+    tool_name: String,
+    phrase: String,
+    train_support: usize,
+    holdout_matches: usize,
+    holdout_correct: usize,
+    precision: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LearnedToolHintSet {
+    version: u32,
+    generated_at_ms: u64,
+    hints: Vec<LearnedToolHint>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ToolTrainingReport {
+    trace_count: usize,
+    usable_trace_count: usize,
+    training_count: usize,
+    holdout_count: usize,
+    candidate_count: usize,
+    promoted_hints: Vec<LearnedToolHint>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCandidateHint {
+    tool_name: String,
+    phrase: String,
+    train_support: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RetryTraceRecord {
+    created_at_ms: u64,
+    provider: String,
+    attempts: u32,
+    success: bool,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RetryTrainingReport {
+    trace_count: usize,
+    provider_reports: Vec<api::LearnedRetryPolicy>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct AutoSelfImproveState {
+    last_router_trace_count: usize,
+    last_tool_trace_count: usize,
+    last_retry_trace_count: usize,
+    last_run_ms: u64,
+}
+
+fn run_self_improve_router() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let traces = load_router_traces(&cwd)?;
+    let report = train_router_rules(&traces);
+    let improvement_dir = self_improvement_dir(&cwd);
+    fs::create_dir_all(&improvement_dir)?;
+
+    let rules = LearnedRouterRuleSet {
+        version: 1,
+        generated_at_ms: now_unix_ms(),
+        rules: report.promoted_rules.clone(),
+    };
+    fs::write(
+        improvement_dir.join("router-rules.json"),
+        serde_json::to_string_pretty(&rules)?,
+    )?;
+    fs::write(
+        improvement_dir.join("router-training-report.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
+
+    println!(
+        "{}",
+        json!({
+            "trace_count": report.trace_count,
+            "usable_trace_count": report.usable_trace_count,
+            "training_count": report.training_count,
+            "holdout_count": report.holdout_count,
+            "candidate_count": report.candidate_count,
+            "promoted_rule_count": report.promoted_rules.len(),
+            "rules_path": improvement_dir.join("router-rules.json"),
+            "report_path": improvement_dir.join("router-training-report.json"),
+        })
+    );
+    Ok(())
+}
+
+fn run_self_improve_tools() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let traces = load_tool_traces(&cwd)?;
+    let report = train_tool_hints(&traces);
+    let improvement_dir = self_improvement_dir(&cwd);
+    fs::create_dir_all(&improvement_dir)?;
+
+    let hints = LearnedToolHintSet {
+        version: 1,
+        generated_at_ms: now_unix_ms(),
+        hints: report.promoted_hints.clone(),
+    };
+    fs::write(
+        improvement_dir.join("tool-hints.json"),
+        serde_json::to_string_pretty(&hints)?,
+    )?;
+    fs::write(
+        improvement_dir.join("tool-training-report.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
+    println!(
+        "{}",
+        json!({
+            "trace_count": report.trace_count,
+            "usable_trace_count": report.usable_trace_count,
+            "training_count": report.training_count,
+            "holdout_count": report.holdout_count,
+            "candidate_count": report.candidate_count,
+            "promoted_hint_count": report.promoted_hints.len(),
+            "hints_path": improvement_dir.join("tool-hints.json"),
+            "report_path": improvement_dir.join("tool-training-report.json"),
+        })
+    );
+    Ok(())
+}
+
+fn run_self_improve_retries() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let traces = load_retry_traces(&cwd)?;
+    let report = train_retry_policy(&traces);
+    let improvement_dir = self_improvement_dir(&cwd);
+    fs::create_dir_all(&improvement_dir)?;
+
+    let policy_set = json!({
+        "version": 1,
+        "generated_at_ms": now_unix_ms(),
+        "policies": report.provider_reports,
+    });
+    fs::write(
+        improvement_dir.join("retry-policy.json"),
+        serde_json::to_string_pretty(&policy_set)?,
+    )?;
+    fs::write(
+        improvement_dir.join("retry-training-report.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
+    println!(
+        "{}",
+        json!({
+            "trace_count": report.trace_count,
+            "provider_count": report.provider_reports.len(),
+            "policy_path": improvement_dir.join("retry-policy.json"),
+            "report_path": improvement_dir.join("retry-training-report.json"),
+        })
+    );
+    Ok(())
+}
+
+fn load_router_traces(cwd: &Path) -> io::Result<Vec<RouterTraceRecord>> {
+    let trace_path = self_improvement_dir(cwd).join("router-traces.jsonl");
+    if !trace_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = fs::read_to_string(trace_path)?;
+    Ok(contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<RouterTraceRecord>(line).ok())
+        .collect())
+}
+
+fn load_tool_traces(cwd: &Path) -> io::Result<Vec<ToolTraceRecord>> {
+    let trace_path = self_improvement_dir(cwd).join("tool-traces.jsonl");
+    if !trace_path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = fs::read_to_string(trace_path)?;
+    Ok(contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<ToolTraceRecord>(line).ok())
+        .collect())
+}
+
+fn load_retry_traces(cwd: &Path) -> io::Result<Vec<RetryTraceRecord>> {
+    let trace_path = self_improvement_dir(cwd).join("retry-traces.jsonl");
+    if !trace_path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = fs::read_to_string(trace_path)?;
+    Ok(contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<RetryTraceRecord>(line).ok())
+        .collect())
+}
+
+fn load_learned_router_rules(cwd: &Path) -> Vec<LearnedRouterRule> {
+    let path = self_improvement_dir(cwd).join("router-rules.json");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(rule_set) = serde_json::from_str::<LearnedRouterRuleSet>(&contents) else {
+        return Vec::new();
+    };
+    let mut rules = rule_set.rules;
+    rules.sort_by(|left, right| {
+        right
+            .precision
+            .total_cmp(&left.precision)
+            .then_with(|| right.holdout_correct.cmp(&left.holdout_correct))
+            .then_with(|| right.train_support.cmp(&left.train_support))
+            .then_with(|| right.phrase.len().cmp(&left.phrase.len()))
+    });
+    rules
+}
+
+fn load_learned_tool_hints(cwd: &Path) -> Vec<LearnedToolHint> {
+    let path = self_improvement_dir(cwd).join("tool-hints.json");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(hints) = serde_json::from_str::<LearnedToolHintSet>(&contents) else {
+        return Vec::new();
+    };
+    let mut hints = hints.hints;
+    hints.sort_by(|left, right| {
+        right
+            .precision
+            .total_cmp(&left.precision)
+            .then_with(|| right.holdout_correct.cmp(&left.holdout_correct))
+            .then_with(|| right.train_support.cmp(&left.train_support))
+            .then_with(|| right.phrase.len().cmp(&left.phrase.len()))
+    });
+    hints
+}
+
+fn train_router_rules(traces: &[RouterTraceRecord]) -> RouterTrainingReport {
+    let usable = traces
+        .iter()
+        .filter(|trace| trace.success && trace.route == "ollama_bash")
+        .filter_map(|trace| {
+            let family = router_command_family(&trace.command)?;
+            Some((trace.clone(), family.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    let holdout_count = if usable.len() >= 5 {
+        usable.len().div_ceil(5)
+    } else {
+        0
+    };
+    let training_count = usable.len().saturating_sub(holdout_count);
+    let (training, holdout) = usable.split_at(training_count);
+    let candidates = mine_router_rule_candidates(training);
+    let promoted_rules = evaluate_router_candidates(candidates.clone(), holdout);
+
+    RouterTrainingReport {
+        trace_count: traces.len(),
+        usable_trace_count: usable.len(),
+        training_count,
+        holdout_count,
+        candidate_count: candidates.len(),
+        promoted_rules,
+    }
+}
+
+fn train_tool_hints(traces: &[ToolTraceRecord]) -> ToolTrainingReport {
+    let usable = traces
+        .iter()
+        .filter(|trace| trace.success && trace.tool_names.len() == 1)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let holdout_count = if usable.len() >= 5 {
+        usable.len().div_ceil(5)
+    } else {
+        0
+    };
+    let training_count = usable.len().saturating_sub(holdout_count);
+    let (training, holdout) = usable.split_at(training_count);
+    let candidates = mine_tool_hint_candidates(training);
+    let promoted_hints = evaluate_tool_hint_candidates(candidates.clone(), holdout);
+
+    ToolTrainingReport {
+        trace_count: traces.len(),
+        usable_trace_count: usable.len(),
+        training_count,
+        holdout_count,
+        candidate_count: candidates.len(),
+        promoted_hints,
+    }
+}
+
+fn train_retry_policy(traces: &[RetryTraceRecord]) -> RetryTrainingReport {
+    let mut by_provider: BTreeMap<String, Vec<RetryTraceRecord>> = BTreeMap::new();
+    for trace in traces {
+        by_provider
+            .entry(trace.provider.clone())
+            .or_default()
+            .push(trace.clone());
+    }
+
+    let mut provider_reports = Vec::new();
+    for (provider, entries) in by_provider {
+        let holdout_count = if entries.len() >= 5 {
+            entries.len().div_ceil(5)
+        } else {
+            0
+        };
+        let training_count = entries.len().saturating_sub(holdout_count);
+        let (_training, holdout) = entries.split_at(training_count);
+        let mut best: Option<(u32, f64, f64)> = None;
+
+        for max_retries in 0..=3u32 {
+            let mut successes = 0usize;
+            let mut total_attempts = 0u64;
+            for trace in holdout {
+                let succeeds = trace.success && trace.attempts <= max_retries + 1;
+                if succeeds {
+                    successes += 1;
+                }
+                total_attempts += trace.attempts.min(max_retries + 1) as u64;
+            }
+            let success_rate = if holdout.is_empty() {
+                1.0
+            } else {
+                successes as f64 / holdout.len() as f64
+            };
+            let avg_attempts = if holdout.is_empty() {
+                1.0
+            } else {
+                total_attempts as f64 / holdout.len() as f64
+            };
+            match best {
+                None => best = Some((max_retries, success_rate, avg_attempts)),
+                Some((_, best_success, best_attempts)) => {
+                    if success_rate > best_success
+                        || ((success_rate - best_success).abs() < f64::EPSILON
+                            && avg_attempts < best_attempts)
+                    {
+                        best = Some((max_retries, success_rate, avg_attempts));
+                    }
+                }
+            }
+        }
+
+        if let Some((max_retries, holdout_success_rate, holdout_avg_attempts)) = best {
+            provider_reports.push(api::LearnedRetryPolicy {
+                provider,
+                max_retries,
+                holdout_success_rate,
+                holdout_avg_attempts,
+            });
+        }
+    }
+
+    RetryTrainingReport {
+        trace_count: traces.len(),
+        provider_reports,
+    }
+}
+
+fn mine_router_rule_candidates(training: &[(RouterTraceRecord, String)]) -> Vec<RouterCandidateRule> {
+    let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut families_by_phrase: BTreeMap<String, OrderedSet<String>> = BTreeMap::new();
+
+    for (trace, family) in training {
+        let phrases = candidate_router_phrases(&trace.prompt);
+        for phrase in phrases {
+            *counts.entry((family.clone(), phrase.clone())).or_default() += 1;
+            families_by_phrase
+                .entry(phrase)
+                .or_default()
+                .insert(family.clone());
+        }
+    }
+
+    let mut candidates = counts
+        .into_iter()
+        .filter_map(|((family, phrase), train_support)| {
+            let used_by = families_by_phrase.get(&phrase)?;
+            if used_by.len() != 1 || train_support < 2 {
+                return None;
+            }
+            Some(RouterCandidateRule {
+                family,
+                phrase,
+                train_support,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .train_support
+            .cmp(&left.train_support)
+            .then_with(|| right.phrase.len().cmp(&left.phrase.len()))
+            .then_with(|| left.phrase.cmp(&right.phrase))
+    });
+    candidates
+}
+
+fn mine_tool_hint_candidates(training: &[ToolTraceRecord]) -> Vec<ToolCandidateHint> {
+    let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut tools_by_phrase: BTreeMap<String, OrderedSet<String>> = BTreeMap::new();
+
+    for trace in training {
+        let tool_name = trace.tool_names[0].clone();
+        for phrase in candidate_router_phrases(&trace.prompt) {
+            *counts.entry((tool_name.clone(), phrase.clone())).or_default() += 1;
+            tools_by_phrase
+                .entry(phrase)
+                .or_default()
+                .insert(tool_name.clone());
+        }
+    }
+
+    let mut candidates = counts
+        .into_iter()
+        .filter_map(|((tool_name, phrase), train_support)| {
+            let used_by = tools_by_phrase.get(&phrase)?;
+            if used_by.len() != 1 || train_support < 2 {
+                return None;
+            }
+            Some(ToolCandidateHint {
+                tool_name,
+                phrase,
+                train_support,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .train_support
+            .cmp(&left.train_support)
+            .then_with(|| right.phrase.len().cmp(&left.phrase.len()))
+    });
+    candidates
+}
+
+fn evaluate_tool_hint_candidates(
+    candidates: Vec<ToolCandidateHint>,
+    holdout: &[ToolTraceRecord],
+) -> Vec<LearnedToolHint> {
+    if holdout.is_empty() {
+        return Vec::new();
+    }
+
+    let mut promoted = Vec::new();
+    let mut tools_seen = OrderedSet::new();
+
+    for candidate in candidates {
+        let mut matches = 0usize;
+        let mut correct = 0usize;
+
+        for trace in holdout {
+            let normalized = trace.prompt.to_ascii_lowercase();
+            if normalized.contains(&candidate.phrase) {
+                matches += 1;
+                if trace.tool_names.first() == Some(&candidate.tool_name) {
+                    correct += 1;
+                }
+            }
+        }
+
+        if matches == 0 {
+            continue;
+        }
+        let precision = correct as f64 / matches as f64;
+        if precision < 1.0 || correct == 0 || tools_seen.contains(&candidate.tool_name) {
+            continue;
+        }
+
+        promoted.push(LearnedToolHint {
+            tool_name: candidate.tool_name.clone(),
+            phrase: candidate.phrase.clone(),
+            train_support: candidate.train_support,
+            holdout_matches: matches,
+            holdout_correct: correct,
+            precision,
+        });
+        tools_seen.insert(candidate.tool_name);
+    }
+
+    promoted
+}
+
+fn evaluate_router_candidates(
+    candidates: Vec<RouterCandidateRule>,
+    holdout: &[(RouterTraceRecord, String)],
+) -> Vec<LearnedRouterRule> {
+    if holdout.is_empty() {
+        return Vec::new();
+    }
+
+    let mut promoted = Vec::new();
+    let mut families_seen = OrderedSet::new();
+
+    for candidate in candidates {
+        let mut matches = 0usize;
+        let mut correct = 0usize;
+
+        for (trace, family) in holdout {
+            let normalized = trace.prompt.to_ascii_lowercase();
+            if normalized.contains(&candidate.phrase) {
+                matches += 1;
+                if family == &candidate.family {
+                    correct += 1;
+                }
+            }
+        }
+
+        if matches == 0 {
+            continue;
+        }
+        let precision = correct as f64 / matches as f64;
+        if precision < 1.0 || correct == 0 || families_seen.contains(&candidate.family) {
+            continue;
+        }
+
+        promoted.push(LearnedRouterRule {
+            family: candidate.family.clone(),
+            phrase: candidate.phrase.clone(),
+            train_support: candidate.train_support,
+            holdout_matches: matches,
+            holdout_correct: correct,
+            precision,
+        });
+        families_seen.insert(candidate.family);
+    }
+
+    promoted
+}
+
+fn candidate_router_phrases(prompt: &str) -> Vec<String> {
+    let tokens = router_phrase_tokens(&router_learning_prompt(prompt));
+    let mut phrases = OrderedSet::new();
+
+    for width in 2..=3 {
+        for window in tokens.windows(width) {
+            phrases.insert(window.join(" "));
+        }
+    }
+
+    phrases.into_iter().collect()
+}
+
+fn router_learning_prompt(prompt: &str) -> String {
+    let marker = "use bash to run:";
+    let lower = prompt.to_ascii_lowercase();
+    let Some(start) = lower.find(marker) else {
+        return prompt.to_string();
+    };
+    let raw = match prompt.get(start + marker.len()..) {
+        Some(value) => value.trim(),
+        None => return prompt.to_string(),
+    };
+    let lower_raw = raw.to_ascii_lowercase();
+    let end_markers = [
+        ". return",
+        "\nreturn",
+        ". give",
+        "\ngive",
+        ". summarize",
+        "\nsummarize",
+    ];
+    let end = end_markers
+        .iter()
+        .filter_map(|marker| lower_raw.find(marker))
+        .min()
+        .unwrap_or(raw.len());
+    let tail = raw[end..].trim().trim_start_matches('.').trim();
+    if tail.is_empty() {
+        prompt.to_string()
+    } else {
+        tail.to_string()
+    }
+}
+
+fn router_phrase_tokens(prompt: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "into", "give", "show", "what",
+        "when", "then", "have", "want", "need", "please", "could", "would", "there", "their",
+        "about", "return", "summarize", "exactly", "using",
+    ];
+
+    prompt
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let normalized = token.to_ascii_lowercase();
+            if normalized.len() < 3 || STOPWORDS.contains(&normalized.as_str()) {
+                None
+            } else {
+                Some(normalized)
+            }
+        })
+        .collect()
+}
+
+fn router_command_family(command: &str) -> Option<&'static str> {
+    let normalized = command.trim().to_ascii_lowercase();
+    if normalized == "git status --short --branch" {
+        Some("git_status")
+    } else if normalized == "git diff" {
+        Some("git_diff")
+    } else if normalized == "rg --files" {
+        Some("list_files")
+    } else if normalized == "pwd" {
+        Some("pwd")
+    } else if normalized.starts_with("ssh ") && normalized.contains(" uptime") {
+        Some("ssh_uptime")
+    } else {
+        None
+    }
+}
+
+fn self_improvement_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".claw").join("self-improvement")
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+fn maybe_auto_self_improve(model: &str) {
+    if preferred_provider_kind(&api::resolve_model_alias(model)) != ProviderKind::Ollama {
+        return;
+    }
+    if std::env::var("CLAW_AUTO_SELF_IMPROVE")
+        .ok()
+        .is_some_and(|value| value == "0")
+    {
+        return;
+    }
+
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let improvement_dir = self_improvement_dir(&cwd);
+    if fs::create_dir_all(&improvement_dir).is_err() {
+        return;
+    }
+
+    let mut state = load_auto_self_improve_state(&improvement_dir);
+    let router_count = count_jsonl_records(&improvement_dir.join("router-traces.jsonl"));
+    let tool_count = count_jsonl_records(&improvement_dir.join("tool-traces.jsonl"));
+    let retry_count = count_jsonl_records(&improvement_dir.join("retry-traces.jsonl"));
+
+    let mut changed = false;
+
+    if router_count >= 5 && router_count.saturating_sub(state.last_router_trace_count) >= 3 {
+        if let Ok(traces) = load_router_traces(&cwd) {
+            let report = train_router_rules(&traces);
+            let rules = LearnedRouterRuleSet {
+                version: 1,
+                generated_at_ms: now_unix_ms(),
+                rules: report.promoted_rules,
+            };
+            if let Ok(contents) = serde_json::to_string_pretty(&rules) {
+                let _ = fs::write(improvement_dir.join("router-rules.json"), contents);
+                state.last_router_trace_count = router_count;
+                changed = true;
+            }
+        }
+    }
+
+    if tool_count >= 5 && tool_count.saturating_sub(state.last_tool_trace_count) >= 2 {
+        if let Ok(traces) = load_tool_traces(&cwd) {
+            let report = train_tool_hints(&traces);
+            let hints = LearnedToolHintSet {
+                version: 1,
+                generated_at_ms: now_unix_ms(),
+                hints: report.promoted_hints,
+            };
+            if let Ok(contents) = serde_json::to_string_pretty(&hints) {
+                let _ = fs::write(improvement_dir.join("tool-hints.json"), contents);
+                state.last_tool_trace_count = tool_count;
+                changed = true;
+            }
+        }
+    }
+
+    if retry_count >= 1 && retry_count.saturating_sub(state.last_retry_trace_count) >= 1 {
+        if let Ok(traces) = load_retry_traces(&cwd) {
+            let report = train_retry_policy(&traces);
+            let policy_set = json!({
+                "version": 1,
+                "generated_at_ms": now_unix_ms(),
+                "policies": report.provider_reports,
+            });
+            let _ = fs::write(
+                improvement_dir.join("retry-policy.json"),
+                serde_json::to_string_pretty(&policy_set).unwrap_or_else(|_| "{}".to_string()),
+            );
+            state.last_retry_trace_count = retry_count;
+            changed = true;
+        }
+    }
+
+    if changed {
+        state.last_run_ms = now_unix_ms();
+        let _ = save_auto_self_improve_state(&improvement_dir, &state);
+    }
+}
+
+fn load_auto_self_improve_state(improvement_dir: &Path) -> AutoSelfImproveState {
+    let path = improvement_dir.join("auto-self-improve-state.json");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return AutoSelfImproveState::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+fn save_auto_self_improve_state(
+    improvement_dir: &Path,
+    state: &AutoSelfImproveState,
+) -> io::Result<()> {
+    fs::write(
+        improvement_dir.join("auto-self-improve-state.json"),
+        serde_json::to_string_pretty(state)?,
+    )
+}
+
+fn count_jsonl_records(path: &Path) -> usize {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return 0;
+    };
+    contents.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn record_tool_trace(
+    model: &str,
+    prompt: &str,
+    summary: &runtime::TurnSummary,
+    duration_ms: u128,
+    fast_path: Option<&str>,
+) {
+    let tool_names = summary
+        .assistant_messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if tool_names.is_empty() {
+        return;
+    }
+    let success = summary
+        .tool_results
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .all(|block| match block {
+            ContentBlock::ToolResult { is_error, .. } => !is_error,
+            _ => true,
+        });
+
+    write_tool_trace(ToolTraceRecord {
+        created_at_ms: now_unix_ms(),
+        model: model.to_string(),
+        prompt: prompt.to_string(),
+        tool_names,
+        duration_ms: duration_ms as u64,
+        success,
+        iterations: summary.iterations,
+        fast_path: fast_path.map(ToOwned::to_owned),
+    });
+}
+
+fn record_fast_tool_trace(
+    model: &str,
+    prompt: &str,
+    tool_name: &str,
+    duration_ms: u128,
+    success: bool,
+    fast_path: &str,
+) {
+    write_tool_trace(ToolTraceRecord {
+        created_at_ms: now_unix_ms(),
+        model: model.to_string(),
+        prompt: prompt.to_string(),
+        tool_names: vec![tool_name.to_string()],
+        duration_ms: duration_ms as u64,
+        success,
+        iterations: 1,
+        fast_path: Some(fast_path.to_string()),
+    });
+}
+
+fn write_tool_trace(record: ToolTraceRecord) {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let trace_dir = self_improvement_dir(&cwd);
+    if fs::create_dir_all(&trace_dir).is_err() {
+        return;
+    }
+    let trace_path = trace_dir.join("tool-traces.jsonl");
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace_path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{}", json!(record));
+}
+
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -4412,7 +5629,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -4431,11 +5648,26 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let resolved_model = api::resolve_model_alias(&model);
+        let client = match preferred_provider_kind(&resolved_model) {
+            ProviderKind::Anthropic => ProviderClient::Anthropic(
+                AnthropicClient::from_auth(resolve_cli_auth_source()?)
+                    .with_base_url(api::read_base_url())
+                    .with_prompt_cache(PromptCache::new(session_id)),
+            ),
+            ProviderKind::OpenAi => ProviderClient::OpenAi(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::openai(),
+            )?),
+            ProviderKind::Ollama => ProviderClient::Ollama(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::ollama(),
+            )?),
+            ProviderKind::Xai => {
+                ProviderClient::from_model(&resolved_model).map_err(std::io::Error::other)?
+            }
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             model,
             enable_tools,
             emit_output,
@@ -4444,6 +5676,42 @@ impl AnthropicRuntimeClient {
             progress_reporter,
         })
     }
+}
+
+fn preferred_provider_kind(model: &str) -> ProviderKind {
+    let trimmed = model.trim();
+    if trimmed.starts_with("claude") {
+        return ProviderKind::Anthropic;
+    }
+    if trimmed.starts_with("grok") {
+        return ProviderKind::Xai;
+    }
+    if trimmed.contains(':')
+        || std::env::var("OLLAMA_BASE_URL")
+            .ok()
+            .is_some_and(|value| !value.is_empty())
+        || std::env::var("OLLAMA_HOST")
+            .ok()
+            .is_some_and(|value| !value.is_empty())
+        || std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .is_some_and(|value| value.contains("11434"))
+    {
+        return ProviderKind::Ollama;
+    }
+    if std::env::var("OPENAI_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return ProviderKind::OpenAi;
+    }
+    if std::env::var("XAI_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return ProviderKind::Xai;
+    }
+    ProviderKind::Anthropic
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -4601,7 +5869,7 @@ impl ApiClient for AnthropicRuntimeClient {
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
-    summary
+    let assistant_text = summary
         .assistant_messages
         .last()
         .map(|message| {
@@ -4614,6 +5882,35 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("")
+        })
+        .unwrap_or_default();
+
+    if !assistant_text.is_empty() {
+        return assistant_text;
+    }
+
+    summary
+        .tool_results
+        .iter()
+        .rev()
+        .flat_map(|message| message.blocks.iter())
+        .find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name, output, is_error, ..
+            } if matches!(tool_name.as_str(), "SendUserMessage" | "Brief") => {
+                serde_json::from_str::<serde_json::Value>(output)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("message")
+                            .and_then(|message| message.as_str())
+                            .map(ToOwned::to_owned)
+                    })
+            }
+            ContentBlock::ToolResult { output, is_error, .. } if !is_error => {
+                Some(output.clone())
+            }
+            _ => None,
         })
         .unwrap_or_default()
 }
@@ -5238,7 +6535,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -5485,6 +6782,9 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
     writeln!(out, "  claw skills")?;
+    writeln!(out, "  claw self-improve router")?;
+    writeln!(out, "  claw self-improve tools")?;
+    writeln!(out, "  claw self-improve retries")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
@@ -5581,12 +6881,14 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         permission_policy, print_help_to, push_output_block, render_config_report,
         render_diff_report, render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_session_reference, response_to_events,
+        resolve_model_alias, resolve_session_reference, response_to_events, router_learning_prompt,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        train_retry_policy, train_router_rules, train_tool_hints, write_mcp_server_fixture,
+        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, RetryTraceRecord,
+        RouterTraceRecord, SlashCommand, StatusUsage, ToolTraceRecord, AutoSelfImproveState,
+        load_auto_self_improve_state, save_auto_self_improve_state, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -5961,6 +7263,21 @@ mod tests {
         assert_eq!(
             parse_args(&["skills".to_string()]).expect("skills should parse"),
             CliAction::Skills { args: None }
+        );
+        assert_eq!(
+            parse_args(&["self-improve".to_string(), "router".to_string()])
+                .expect("self-improve router should parse"),
+            CliAction::SelfImproveRouter
+        );
+        assert_eq!(
+            parse_args(&["self-improve".to_string(), "tools".to_string()])
+                .expect("self-improve tools should parse"),
+            CliAction::SelfImproveTools
+        );
+        assert_eq!(
+            parse_args(&["self-improve".to_string(), "retries".to_string()])
+                .expect("self-improve retries should parse"),
+            CliAction::SelfImproveRetries
         );
         assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
@@ -6398,7 +7715,241 @@ mod tests {
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
+        assert!(help.contains("claw self-improve router"));
+        assert!(help.contains("claw self-improve tools"));
+        assert!(help.contains("claw self-improve retries"));
         assert!(help.contains("claw /skills"));
+    }
+
+    #[test]
+    fn router_learning_prompt_drops_explicit_command_text() {
+        assert_eq!(
+            router_learning_prompt(
+                "Use bash to run: git status --short --branch. Return branch status."
+            ),
+            "Return branch status.".to_string()
+        );
+    }
+
+    #[test]
+    fn train_router_rules_promotes_precise_aliases() {
+        let traces = vec![
+            RouterTraceRecord {
+                created_at_ms: 1,
+                model: "qwen3:8b".to_string(),
+                route: "ollama_bash".to_string(),
+                prompt: "Use bash to run: git status --short --branch. Return branch status."
+                    .to_string(),
+                command: "git status --short --branch".to_string(),
+                duration_ms: 10,
+                success: true,
+                output_preview: String::new(),
+            },
+            RouterTraceRecord {
+                created_at_ms: 2,
+                model: "qwen3:8b".to_string(),
+                route: "ollama_bash".to_string(),
+                prompt: "Use bash to run: git status --short --branch. Give branch status."
+                    .to_string(),
+                command: "git status --short --branch".to_string(),
+                duration_ms: 10,
+                success: true,
+                output_preview: String::new(),
+            },
+            RouterTraceRecord {
+                created_at_ms: 3,
+                model: "qwen3:8b".to_string(),
+                route: "ollama_bash".to_string(),
+                prompt: "Use bash to run: git diff. Return working tree diff.".to_string(),
+                command: "git diff".to_string(),
+                duration_ms: 10,
+                success: true,
+                output_preview: String::new(),
+            },
+            RouterTraceRecord {
+                created_at_ms: 4,
+                model: "qwen3:8b".to_string(),
+                route: "ollama_bash".to_string(),
+                prompt: "Use bash to run: git diff. Give working tree diff.".to_string(),
+                command: "git diff".to_string(),
+                duration_ms: 10,
+                success: true,
+                output_preview: String::new(),
+            },
+            RouterTraceRecord {
+                created_at_ms: 5,
+                model: "qwen3:8b".to_string(),
+                route: "ollama_bash".to_string(),
+                prompt: "Use bash to run: git status --short --branch. Summarize branch status."
+                    .to_string(),
+                command: "git status --short --branch".to_string(),
+                duration_ms: 10,
+                success: true,
+                output_preview: String::new(),
+            },
+            RouterTraceRecord {
+                created_at_ms: 6,
+                model: "qwen3:8b".to_string(),
+                route: "ollama_bash".to_string(),
+                prompt: "Use bash to run: git diff. Summarize working tree diff.".to_string(),
+                command: "git diff".to_string(),
+                duration_ms: 10,
+                success: true,
+                output_preview: String::new(),
+            },
+        ];
+
+        let report = train_router_rules(&traces);
+        assert_eq!(report.promoted_rules.len(), 2);
+        assert!(report
+            .promoted_rules
+            .iter()
+            .any(|rule| rule.family == "git_status" && rule.phrase == "branch status"));
+        assert!(report
+            .promoted_rules
+            .iter()
+            .any(|rule| rule.family == "git_diff" && rule.phrase == "working tree diff"));
+    }
+
+    #[test]
+    fn train_tool_hints_promotes_precise_aliases() {
+        let traces = vec![
+            ToolTraceRecord {
+                created_at_ms: 1,
+                model: "qwen3:8b".to_string(),
+                prompt: "what is the branch status right now".to_string(),
+                tool_names: vec!["bash".to_string()],
+                duration_ms: 10,
+                success: true,
+                iterations: 1,
+                fast_path: Some("ollama_bash".to_string()),
+            },
+            ToolTraceRecord {
+                created_at_ms: 2,
+                model: "qwen3:8b".to_string(),
+                prompt: "show branch status".to_string(),
+                tool_names: vec!["bash".to_string()],
+                duration_ms: 10,
+                success: true,
+                iterations: 1,
+                fast_path: Some("ollama_bash".to_string()),
+            },
+            ToolTraceRecord {
+                created_at_ms: 3,
+                model: "qwen3:8b".to_string(),
+                prompt: "return structured json output".to_string(),
+                tool_names: vec!["StructuredOutput".to_string()],
+                duration_ms: 10,
+                success: true,
+                iterations: 1,
+                fast_path: None,
+            },
+            ToolTraceRecord {
+                created_at_ms: 4,
+                model: "qwen3:8b".to_string(),
+                prompt: "give structured json output".to_string(),
+                tool_names: vec!["StructuredOutput".to_string()],
+                duration_ms: 10,
+                success: true,
+                iterations: 1,
+                fast_path: None,
+            },
+            ToolTraceRecord {
+                created_at_ms: 5,
+                model: "qwen3:8b".to_string(),
+                prompt: "summarize branch status".to_string(),
+                tool_names: vec!["bash".to_string()],
+                duration_ms: 10,
+                success: true,
+                iterations: 1,
+                fast_path: Some("ollama_bash".to_string()),
+            },
+            ToolTraceRecord {
+                created_at_ms: 6,
+                model: "qwen3:8b".to_string(),
+                prompt: "summarize structured json output".to_string(),
+                tool_names: vec!["StructuredOutput".to_string()],
+                duration_ms: 10,
+                success: true,
+                iterations: 1,
+                fast_path: None,
+            },
+        ];
+
+        let report = train_tool_hints(&traces);
+        assert_eq!(report.promoted_hints.len(), 2);
+        assert!(report
+            .promoted_hints
+            .iter()
+            .any(|hint| hint.tool_name == "bash" && hint.phrase == "branch status"));
+        assert!(report
+            .promoted_hints
+            .iter()
+            .any(|hint| hint.tool_name == "StructuredOutput"));
+    }
+
+    #[test]
+    fn train_retry_policy_prefers_low_attempt_success() {
+        let traces = vec![
+            RetryTraceRecord {
+                created_at_ms: 1,
+                provider: "ollama".to_string(),
+                attempts: 1,
+                success: true,
+                duration_ms: 50,
+            },
+            RetryTraceRecord {
+                created_at_ms: 2,
+                provider: "ollama".to_string(),
+                attempts: 1,
+                success: true,
+                duration_ms: 40,
+            },
+            RetryTraceRecord {
+                created_at_ms: 3,
+                provider: "ollama".to_string(),
+                attempts: 2,
+                success: true,
+                duration_ms: 80,
+            },
+            RetryTraceRecord {
+                created_at_ms: 4,
+                provider: "ollama".to_string(),
+                attempts: 1,
+                success: true,
+                duration_ms: 45,
+            },
+            RetryTraceRecord {
+                created_at_ms: 5,
+                provider: "ollama".to_string(),
+                attempts: 1,
+                success: true,
+                duration_ms: 44,
+            },
+        ];
+
+        let report = train_retry_policy(&traces);
+        assert_eq!(report.provider_reports.len(), 1);
+        assert_eq!(report.provider_reports[0].provider, "ollama");
+        assert_eq!(report.provider_reports[0].max_retries, 0);
+    }
+
+    #[test]
+    fn auto_self_improve_state_roundtrips() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).expect("state dir should exist");
+        let state = AutoSelfImproveState {
+            last_router_trace_count: 7,
+            last_tool_trace_count: 3,
+            last_retry_trace_count: 1,
+            last_run_ms: 42,
+        };
+        save_auto_self_improve_state(&dir, &state).expect("state should save");
+        let loaded = load_auto_self_improve_state(&dir);
+        assert_eq!(loaded.last_router_trace_count, 7);
+        assert_eq!(loaded.last_tool_trace_count, 3);
+        assert_eq!(loaded.last_retry_trace_count, 1);
+        assert_eq!(loaded.last_run_ms, 42);
     }
 
     #[test]

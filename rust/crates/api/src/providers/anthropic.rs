@@ -14,7 +14,7 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
-use super::{Provider, ProviderFuture};
+use super::{record_retry_trace, Provider, ProviderFuture, ProviderKind};
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
@@ -398,6 +398,7 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        let started = std::time::Instant::now();
         let mut attempts = 0;
         let mut last_error: Option<ApiError>;
 
@@ -424,6 +425,12 @@ impl AnthropicClient {
                                 Map::new(),
                             );
                         }
+                        record_retry_trace(
+                            ProviderKind::Anthropic,
+                            attempts,
+                            true,
+                            started.elapsed().as_millis(),
+                        );
                         return Ok(response);
                     }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
@@ -432,6 +439,12 @@ impl AnthropicClient {
                     }
                     Err(error) => {
                         self.record_request_failure(attempts, &error);
+                        record_retry_trace(
+                            ProviderKind::Anthropic,
+                            attempts,
+                            false,
+                            started.elapsed().as_millis(),
+                        );
                         return Err(error);
                     }
                 },
@@ -441,6 +454,12 @@ impl AnthropicClient {
                 }
                 Err(error) => {
                     self.record_request_failure(attempts, &error);
+                    record_retry_trace(
+                        ProviderKind::Anthropic,
+                        attempts,
+                        false,
+                        started.elapsed().as_millis(),
+                    );
                     return Err(error);
                 }
             }
@@ -452,6 +471,12 @@ impl AnthropicClient {
             tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
         }
 
+        record_retry_trace(
+            ProviderKind::Anthropic,
+            attempts,
+            false,
+            started.elapsed().as_millis(),
+        );
         Err(ApiError::RetriesExhausted {
             attempts,
             last_error: Box::new(last_error.expect("retry loop must capture an error")),

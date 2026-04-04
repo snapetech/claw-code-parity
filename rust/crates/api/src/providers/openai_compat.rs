@@ -12,10 +12,11 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{Provider, ProviderFuture};
+use super::{record_retry_trace, Provider, ProviderFuture, ProviderKind};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -32,6 +33,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const OLLAMA_ENV_VARS: &[&str] = &["OLLAMA_API_KEY", "OLLAMA_BASE_URL", "OLLAMA_HOST"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -53,11 +55,22 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
         }
     }
+
+    #[must_use]
+    pub const fn ollama() -> Self {
+        Self {
+            provider_name: "Ollama",
+            api_key_env: "OLLAMA_API_KEY",
+            base_url_env: "OLLAMA_BASE_URL",
+            default_base_url: DEFAULT_OLLAMA_BASE_URL,
+        }
+    }
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "Ollama" => OLLAMA_ENV_VARS,
             _ => &[],
         }
     }
@@ -92,11 +105,18 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
-            return Err(ApiError::missing_credentials(
-                config.provider_name,
-                config.credential_env_vars(),
-            ));
+        let api_key = if config.provider_name == "Ollama" {
+            read_env_non_empty(config.api_key_env)?
+                .or_else(|| read_env_non_empty("OPENAI_API_KEY").ok().flatten())
+                .unwrap_or_else(|| "ollama".to_string())
+        } else {
+            let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+                return Err(ApiError::missing_credentials(
+                    config.provider_name,
+                    config.credential_env_vars(),
+                ));
+            };
+            api_key
         };
         Ok(Self::new(api_key, config))
     }
@@ -159,18 +179,43 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        let started = std::time::Instant::now();
         let mut attempts = 0;
 
         let last_error = loop {
             attempts += 1;
             let retryable_error = match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        record_retry_trace(
+                            provider_kind_for_config(self.config),
+                            attempts,
+                            true,
+                            started.elapsed().as_millis(),
+                        );
+                        return Ok(response);
+                    }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        record_retry_trace(
+                            provider_kind_for_config(self.config),
+                            attempts,
+                            false,
+                            started.elapsed().as_millis(),
+                        );
+                        return Err(error);
+                    }
                 },
                 Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    record_retry_trace(
+                        provider_kind_for_config(self.config),
+                        attempts,
+                        false,
+                        started.elapsed().as_millis(),
+                    );
+                    return Err(error);
+                }
             };
 
             if attempts > self.max_retries {
@@ -180,6 +225,12 @@ impl OpenAiCompatClient {
             tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
         };
 
+        record_retry_trace(
+            provider_kind_for_config(self.config),
+            attempts,
+            false,
+            started.elapsed().as_millis(),
+        );
         Err(ApiError::RetriesExhausted {
             attempts,
             last_error: Box::new(last_error),
@@ -212,6 +263,15 @@ impl OpenAiCompatClient {
             .initial_backoff
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
+    }
+}
+
+fn provider_kind_for_config(config: OpenAiCompatConfig) -> ProviderKind {
+    match config.provider_name {
+        "xAI" => ProviderKind::Xai,
+        "OpenAI" => ProviderKind::OpenAi,
+        "Ollama" => ProviderKind::Ollama,
+        _ => ProviderKind::OpenAi,
     }
 }
 
@@ -878,6 +938,22 @@ pub fn has_api_key(key: &str) -> bool {
 
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
+    if config.provider_name == "Ollama" {
+        if let Ok(value) = std::env::var(config.base_url_env) {
+            if !value.is_empty() {
+                return value;
+            }
+        }
+        if let Ok(host) = std::env::var("OLLAMA_HOST") {
+            if !host.is_empty() {
+                let trimmed = host.trim_end_matches('/');
+                if trimmed.ends_with("/v1") {
+                    return trimmed.to_string();
+                }
+                return format!("{trimmed}/v1");
+            }
+        }
+    }
     std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
 }
 

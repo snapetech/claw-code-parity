@@ -35,6 +35,76 @@ Or authenticate via OAuth:
 claw login
 ```
 
+## Ollama
+
+The Rust CLI now supports a first-class Ollama mode through the OpenAI-compatible local endpoint.
+
+Recommended local setup:
+
+```bash
+export OLLAMA_BASE_URL="http://127.0.0.1:11434/v1"
+unset OLLAMA_API_KEY OPENAI_API_KEY OPENAI_BASE_URL
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+unset XAI_API_KEY XAI_BASE_URL
+```
+
+Notes:
+
+- Use `127.0.0.1`, not `localhost`, to avoid local resolution issues.
+- `OLLAMA_API_KEY` is optional. The CLI uses a dummy token automatically for Ollama.
+- Models with a tag, such as `qwen3:8b` or `qwen3:14b`, are detected as Ollama models directly.
+
+Examples:
+
+```bash
+# Fast local one-shot run
+./target/release/claw --model qwen3:8b prompt "summarize this repository"
+
+# Stronger local model
+./target/release/claw --model qwen3:14b prompt "review the current diff"
+
+# Narrow tool surface for a deterministic local run
+./target/release/claw \
+  --model qwen3:14b \
+  --allowedTools SendUserMessage \
+  --permission-mode read-only \
+  --output-format json \
+  prompt "Use the SendUserMessage tool once with message exactly claw ollama ok. Do not call any other tool."
+```
+
+Current recommendation on a MacBook Air M4 16 GB:
+
+- `qwen3:8b` for fast interactive work
+- `qwen3:14b` for better quality when extra latency is acceptable
+
+## Self-Improvement
+
+The CLI now includes a gated offline router-improvement loop.
+
+Runtime behavior:
+
+- successful Ollama fast-path routes append traces to `.claw/self-improvement/router-traces.jsonl`
+- promoted learned rules are loaded from `.claw/self-improvement/router-rules.json`
+
+Train and promote router rules:
+
+```bash
+./target/release/claw self-improve router
+```
+
+That command:
+
+- reads successful router traces
+- mines candidate alias phrases by command family
+- evaluates them on held-out traces
+- only promotes rules with perfect held-out precision
+- writes a report to `.claw/self-improvement/router-training-report.json`
+
+Example outcome:
+
+- traces teach the router that `branch status` means `git status --short --branch`
+- traces teach the router that `working tree diff` means `git diff`
+
 ## Mock parity harness
 
 The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
